@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+python-multipart
+markitdown[all]
+pypdf
+qdrant-client
