@@ -139,7 +139,7 @@ Open **Settings** in the app and set:
 ```
 rubyui/
 ├── Dockerfile
-//├── requirements.txt
+├── requirements.txt
 ├── compose.yaml
 ├── api/                 → mounted into the backend container at /app
 │   ├── server.py
