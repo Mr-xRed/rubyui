@@ -24,10 +24,30 @@ let USE_BACKEND_CHAT = (() => {
   return saved === null ? true : saved === 'true';
 })();
 
+// crypto.randomUUID() only exists in secure contexts (https, or
+// http://localhost) — accessing this app over plain HTTP on a LAN IP
+// (e.g. http://10.x.x.x:8090) is NOT a secure context, so the browser
+// leaves crypto.randomUUID undefined there. Calling it unguarded threw an
+// uncaught TypeError at global scope, which halted the rest of this
+// script — meaning CLIENT_ID (and everything below it) never got
+// initialized, cascading into "Cannot access 'X' before initialization"
+// errors in every other file that loads after main.js. Same fallback
+// pattern used in memory.js's _uuidv4() for the same reason.
+function _uuidv4() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try { return crypto.randomUUID(); } catch (_) {}
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 // Stable per-browser UUID — survives page close, works behind any proxy.
 const CLIENT_ID = (() => {
   let id = localStorage.getItem('_jarvis_client_id');
-  if (!id) { id = crypto.randomUUID(); localStorage.setItem('_jarvis_client_id', id); }
+  if (!id) { id = _uuidv4(); localStorage.setItem('_jarvis_client_id', id); }
   return id;
 })();
 
