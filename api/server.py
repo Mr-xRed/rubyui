@@ -7,7 +7,6 @@ import httpx
 from markitdown import MarkItDown
 from markitdown.converters._html_converter import HtmlConverter
 import pandas as pd
-import pymupdf4llm
 _markitdown = MarkItDown()  # stateless, safe to reuse across requests
 
 # Used only for the custom Excel path below (convert_file bypasses the
@@ -197,10 +196,10 @@ async def xlsx_sheets(file: UploadFile = File(...)):
 @app.post("/api/convert-file")
 async def convert_file(file: UploadFile = File(...), sheets: str | None = Form(None)):
     """Convert an uploaded file to Markdown.
-    PDF → pymupdf4llm (layout-aware: tables, headings, columns).
     XLSX/XLS → custom pandas path (sheet filtering + na_rep='' instead of
     MarkItDown's default, which writes empty cells as the literal "NaN").
-    Everything else → MarkItDown (docx, pptx, csv, html, xml, json, zip).
+    Everything else (including PDF) → MarkItDown (docx, pptx, csv, html,
+    xml, json, zip, pdf).
 
     `sheets` (optional): JSON-encoded list of sheet names to include. Only
     used for .xlsx/.xls; ignored otherwise. Omit/None = all sheets (back-
@@ -211,9 +210,7 @@ async def convert_file(file: UploadFile = File(...), sheets: str | None = Form(N
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
-        if suffix == ".pdf":
-            markdown = pymupdf4llm.to_markdown(tmp_path)
-        elif suffix in _EXCEL_EXTS:
+        if suffix in _EXCEL_EXTS:
             sheet_filter = json.loads(sheets) if sheets else None
             markdown = _convert_excel_sheets(tmp_path, suffix, sheet_filter)
         else:
@@ -1329,9 +1326,9 @@ async def _execute_rag_search_tool(tc: dict, job: dict, job_id: str, cid: str) -
         }), False
 
     # Pass through the full chunk payload by default (source, score, text,
-    # plus whatever extra metadata fields the collection stores — ril_number,
-    # page, section_title, module_title, breadcrumb, etc.), then apply the
-    # user's whitelist/blacklist (Settings → RAG) if one is configured.
+    # plus whatever extra metadata fields the collection stores — page,
+    # section_title, breadcrumb, etc.), then apply the user's whitelist/
+    # blacklist (Settings → RAG) if one is configured.
     filtered = [_filter_rag_fields(c, job) for c in chunks]
     return json.dumps({"query": query, "top_k": top_k, "results": filtered}), False
 
