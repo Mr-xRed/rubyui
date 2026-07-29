@@ -100,30 +100,17 @@ const ToolsEngine = {
         },
         required: ['text']
       },
-      // Resolved server-side when the turn is offloaded to the backend job
-      // queue (see _execute_save_memory_tool in server.py) — this client
-      // implementation only runs on the direct/local path, same split as
-      // generate_image / rag_search above.
+      // Delegates to memory.js's executeSaveMemoryTool(), same pattern as
+      // rag_search delegating to rag.js's executeRagSearchTool() below.
+      // That function branches internally: goes through /api/memory/save
+      // (writes markdown + Qdrant) when BACKEND_AVAILABLE, or writes
+      // directly into Qdrant only when running local/no-backend — see the
+      // comment above executeSaveMemoryTool() in memory.js for what that
+      // fallback does and doesn't preserve.
       async execute({ text, tags, confidence }) {
-        if (!text || !text.trim()) throw new Error('text must not be empty.');
-        const resp = await fetch('/api/memory/save', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Client-ID': (typeof getEffectiveClientId === 'function' ? getEffectiveClientId() : (typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : 'anonymous')) },
-          body: JSON.stringify({
-            text: text.trim().slice(0, 4000),
-            tags: Array.isArray(tags) ? tags.slice(0, 10).map(String) : [],
-            confidence: (confidence === 'inferred') ? 'inferred' : 'stated',
-            source: (typeof CHAT_ID !== 'undefined' && CHAT_ID) || 'chat',
-            embed_model:  RAG_EMBED_MODEL,
-            embed_flavor: RAG_EMBED_FLAVOR,
-            ollama_base:  OLLAMA_BASE,
-            qdrant_url:   RAG_QDRANT_URL,
-          }),
-        });
-        if (!resp.ok) throw new Error(`Failed to save memory: HTTP ${resp.status}`);
-        const data = await resp.json();
-        if (typeof showToast === 'function') showToast(`Saved to memory: "${text.trim().slice(0, 60)}${text.trim().length > 60 ? '…' : ''}"`, 2500);
-        return JSON.stringify({ saved: true, id: data.id, indexed: !!data.indexed });
+        if (typeof window.executeSaveMemoryTool !== 'function')
+          throw new Error('Memory is unavailable (memory.js did not load).');
+        return window.executeSaveMemoryTool({ text, tags, confidence });
       }
     },
     {
@@ -139,27 +126,13 @@ const ToolsEngine = {
         },
         required: ['query']
       },
+      // Delegates to memory.js's executeSearchMemoryTool() — searches
+      // Qdrant directly in local/no-backend mode, via /api/memory/search
+      // otherwise. See save_memory above for the same pattern.
       async execute({ query, top_k }) {
-        if (!query || !query.trim()) throw new Error('query must not be empty.');
-        let topK = parseInt(top_k, 10);
-        if (!Number.isFinite(topK)) topK = 5;
-        topK = Math.max(1, Math.min(20, topK));
-        const resp = await fetch('/api/memory/search', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Client-ID': (typeof getEffectiveClientId === 'function' ? getEffectiveClientId() : (typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : 'anonymous')) },
-          body: JSON.stringify({
-            query: query.trim().slice(0, 2000),
-            top_k: topK,
-            score_threshold: (typeof MEMORY_MIN_SCORE === 'number') ? MEMORY_MIN_SCORE : 0.55,
-            embed_model:  RAG_EMBED_MODEL,
-            embed_flavor: RAG_EMBED_FLAVOR,
-            ollama_base:  OLLAMA_BASE,
-            qdrant_url:   RAG_QDRANT_URL,
-          }),
-        });
-        if (!resp.ok) throw new Error(`Memory search failed: HTTP ${resp.status}`);
-        const data = await resp.json();
-        return JSON.stringify({ query: query.trim(), top_k: topK, results: data.results || [] });
+        if (typeof window.executeSearchMemoryTool !== 'function')
+          throw new Error('Memory is unavailable (memory.js did not load).');
+        return window.executeSearchMemoryTool({ query, top_k });
       }
     },
     {
@@ -177,31 +150,14 @@ const ToolsEngine = {
         },
         required: ['id']
       },
-      // Resolved server-side on the backend-offloaded path (see
-      // _execute_update_memory_tool in server.py) — this client
-      // implementation only runs on the direct/local path.
+      // Delegates to memory.js's executeUpdateMemoryTool() — edits the
+      // Qdrant point in place in local/no-backend mode (no markdown to
+      // update), via /api/memory/{id} PUT otherwise. See save_memory above
+      // for the same pattern.
       async execute({ id, text, tags, confidence }) {
-        if (!id || !String(id).trim()) throw new Error('id is required — call search_memory first to find it.');
-        const body = {
-          embed_model:  RAG_EMBED_MODEL,
-          embed_flavor: RAG_EMBED_FLAVOR,
-          ollama_base:  OLLAMA_BASE,
-          qdrant_url:   RAG_QDRANT_URL,
-        };
-        if (typeof text === 'string' && text.trim()) body.text = text.trim().slice(0, 4000);
-        if (Array.isArray(tags)) body.tags = tags.slice(0, 10).map(String);
-        if (confidence === 'stated' || confidence === 'inferred') body.confidence = confidence;
-
-        const resp = await fetch(`/api/memory/${encodeURIComponent(String(id).trim())}`, {
-          method:  'PUT',
-          headers: { 'Content-Type': 'application/json', 'X-Client-ID': (typeof getEffectiveClientId === 'function' ? getEffectiveClientId() : (typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : 'anonymous')) },
-          body: JSON.stringify(body),
-        });
-        if (resp.status === 404) throw new Error(`No memory found with id "${id}". Use search_memory to find the correct id, or save_memory if this is actually new information.`);
-        if (!resp.ok) throw new Error(`Failed to update memory: HTTP ${resp.status}`);
-        const data = await resp.json();
-        if (typeof showToast === 'function') showToast(`Memory updated${text ? `: "${text.trim().slice(0, 60)}${text.trim().length > 60 ? '…' : ''}"` : ''}`, 2500);
-        return JSON.stringify({ updated: true, id: data.id, indexed: !!data.indexed });
+        if (typeof window.executeUpdateMemoryTool !== 'function')
+          throw new Error('Memory is unavailable (memory.js did not load).');
+        return window.executeUpdateMemoryTool({ id, text, tags, confidence });
       }
     }
     // ── Add future built-ins here, same shape ─────────────────

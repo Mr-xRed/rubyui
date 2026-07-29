@@ -149,12 +149,12 @@ let MEMORY_TOP_K = parseInt(localStorage.getItem('memory_top_k')) || 5;
 // Minimum cosine similarity score (0–1) a memory must clear to be injected
 // or returned by search_memory. Filters out low-relevance noise so memory
 // isn't dragged into every single turn regardless of topic. 0 = no filter.
-// 0.55 is a reasonable starting point for nomic-embed-text-style cosine
+// 0.50 is a reasonable starting point for bge-m3-style cosine
 // similarity — clearly-relevant matches on this class of model typically
 // score ~0.5–0.8, unrelated text usually sits below ~0.4. Adjustable in
 // Settings → Memory since the right value depends on the embedding model.
 let MEMORY_MIN_SCORE = parseFloat(localStorage.getItem('memory_min_score'));
-if (!Number.isFinite(MEMORY_MIN_SCORE) || MEMORY_MIN_SCORE < 0 || MEMORY_MIN_SCORE > 1) MEMORY_MIN_SCORE = 0.55;
+if (!Number.isFinite(MEMORY_MIN_SCORE) || MEMORY_MIN_SCORE < 0 || MEMORY_MIN_SCORE > 1) MEMORY_MIN_SCORE = 0.50;
 
 // Description sent to the model for the save_memory built-in tool. Editable
 // later via Settings → Tool Calling → Built-in Tools, same mechanism as

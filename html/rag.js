@@ -98,13 +98,278 @@ function _esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+// ── Direct (no-backend) Qdrant + Ollama client ──────────────────────────
+// Every RAG operation used to unconditionally call this app's own
+// /api/rag/* endpoints (server.py) — which don't exist when the backend
+// isn't running, so with BACKEND_AVAILABLE === false, RAG silently failed
+// even with a perfectly valid Qdrant URL (surfaced in the UI as "Qdrant
+// unreachable" even though the browser never actually tried to reach
+// Qdrant). These helpers talk to Qdrant's REST API and Ollama's embedding
+// endpoint directly from the browser instead, mirroring rag.py's
+// _embed_ollama/_embed_openai and the /search + /collections handlers
+// closely enough to return the same shape.
+//
+// Scope: retrieval only (list collections, search). Ingestion, collection
+// create/delete, and field sampling still require the Python backend (PDF
+// parsing, chunking strategies, batched upserts) and are NOT implemented
+// here — those calls stay backend-only.
+//
+// REQUIRES: Qdrant's CORS enabled (service.enable_cors: true in Qdrant's
+// config, or QDRANT__SERVICE__ENABLE_CORS=true), since the browser now
+// calls Qdrant cross-origin directly. Also requires Qdrant >= 1.10 for the
+// Query API endpoint used below (the same endpoint qdrant-client's
+// query_points() calls server-side in rag.py).
+function _ragDirectMode() {
+  return typeof BACKEND_AVAILABLE === 'undefined' || !BACKEND_AVAILABLE;
+}
+
+async function _embedOllamaDirect(texts, model, baseUrl) {
+  const base = (baseUrl || '').replace(/\/$/, '');
+  try {
+    const resp = await fetch(`${base}/api/embed`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ model, input: texts }),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.embeddings) return data.embeddings;
+    }
+  } catch (_) {}
+  // Fallback: one request per text (older Ollama builds without /api/embed)
+  const results = [];
+  for (const text of texts) {
+    const resp = await fetch(`${base}/api/embeddings`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ model, prompt: text }),
+    });
+    if (!resp.ok) throw new Error(`Ollama embeddings HTTP ${resp.status}`);
+    const data = await resp.json();
+    results.push(data.embedding);
+  }
+  return results;
+}
+
+async function _embedOpenaiDirect(texts, model, baseUrl) {
+  const base = (baseUrl || '').replace(/\/$/, '');
+  const resp = await fetch(`${base}/v1/embeddings`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ model, input: texts }),
+  });
+  if (!resp.ok) throw new Error(`OpenAI embeddings HTTP ${resp.status}`);
+  const data = await resp.json();
+  return (data.data || []).map(item => item.embedding);
+}
+
+async function _embedDirect(texts, model, baseUrl, flavor) {
+  return flavor === 'openai'
+    ? _embedOpenaiDirect(texts, model, baseUrl)
+    : _embedOllamaDirect(texts, model, baseUrl);
+}
+
+// JS port of rag.py's _resolve_payload() — same field-name candidates, so
+// a chunk retrieved directly looks identical to one retrieved via the
+// backend, regardless of which ingestion strategy originally wrote it.
+const _RAG_TEXT_FIELDS   = ['text', 'content', 'page_content', 'body', 'chunk', 'passage', 'document', 'value'];
+const _RAG_SOURCE_FIELDS = ['source', 'filename', 'file', 'url', 'title', 'name', 'origin', 'path', 'document_id', 'doc_id'];
+const _RAG_INDEX_FIELDS  = ['chunk_index', 'chunk_id', 'index', 'seq', 'sequence', 'order', 'position', 'page'];
+
+function _resolveRagPayloadDirect(payload) {
+  if (!payload) return { text: '', source: '', chunk_index: null };
+  const meta = (payload.metadata && typeof payload.metadata === 'object') ? payload.metadata : {};
+
+  const first = (keys, ...dicts) => {
+    for (const d of dicts) {
+      for (const k of keys) {
+        const v = d[k];
+        if (v !== undefined && v !== null && String(v).trim()) return String(v).trim();
+      }
+    }
+    return null;
+  };
+
+  let text = first(_RAG_TEXT_FIELDS, payload, meta);
+  if (!text) {
+    const flat = {};
+    for (const [k, v] of Object.entries(payload)) {
+      if (k !== 'metadata' && (typeof v !== 'object' || v === null)) flat[k] = v;
+    }
+    text = JSON.stringify(Object.keys(flat).length ? flat : payload, null, 2);
+  }
+
+  let source = first(_RAG_SOURCE_FIELDS, payload, meta) || '';
+  if (!source) {
+    for (const [k, v] of Object.entries({ ...payload, ...meta })) {
+      if (typeof v === 'string' && v.length > 3 && v.length < 80 && !['content', 'text', 'body'].includes(k.toLowerCase())) {
+        source = `${k}: ${v}`;
+        break;
+      }
+    }
+  }
+
+  const idxRaw = first(_RAG_INDEX_FIELDS, payload, meta);
+  const chunk_index = (idxRaw !== null && /^\d+$/.test(idxRaw)) ? parseInt(idxRaw, 10) : null;
+
+  const strField = (key) => {
+    const v = payload[key] ?? meta[key];
+    return (v !== undefined && v !== null) ? String(v).trim() : '';
+  };
+
+  const result = {
+    text, source, chunk_index,
+    page:          strField('page'),
+    section_title: strField('section_title'),
+    breadcrumb:    strField('breadcrumb'),
+    csv_headers:   payload.csv_headers || meta.csv_headers || [],
+    json_key:      payload.json_key !== undefined ? payload.json_key : meta.json_key,
+  };
+
+  const known = new Set(['metadata', ..._RAG_TEXT_FIELDS, ..._RAG_SOURCE_FIELDS, ..._RAG_INDEX_FIELDS,
+    'page', 'section_title', 'breadcrumb', 'csv_headers', 'json_key']);
+  for (const [k, v] of Object.entries(meta))    { if (!known.has(k) && !(k in result)) result[k] = v; }
+  for (const [k, v] of Object.entries(payload)) { if (!known.has(k)) result[k] = v; }
+  return result;
+}
+
+/** Direct Qdrant search — mirrors rag.py's /search using Qdrant's Query
+ *  API (POST /collections/{name}/points/query), the same endpoint
+ *  qdrant-client's query_points() calls server-side. */
+async function _qdrantSearchDirect(qdrantUrl, collection, queryVec, topK, scoreThreshold) {
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  const resp = await fetch(`${base}/collections/${encodeURIComponent(collection)}/points/query`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: queryVec,
+      limit: topK,
+      with_payload: true,
+      score_threshold: (scoreThreshold && scoreThreshold > 0) ? scoreThreshold : null,
+    }),
+  });
+  if (!resp.ok) throw new Error(`Qdrant search HTTP ${resp.status}`);
+  const data = await resp.json();
+  const points = (data.result && data.result.points) || [];
+  return points.map(p => ({
+    id:    String(p.id),
+    score: Math.round((p.score || 0) * 1e6) / 1e6,
+    ..._resolveRagPayloadDirect(p.payload || {}),
+  }));
+}
+
+/**
+ * Direct-mode replacement for POST /api/rag/search. Embeds params.query via
+ * Ollama/OpenAI and searches Qdrant directly. Returns the same
+ * {results: [...]} shape the backend endpoint returns, so every call site
+ * (search tab, injectRagContext, executeRagSearchTool) can stay agnostic
+ * to which mode actually ran.
+ */
+async function _ragSearchDirect(params) {
+  const vecs = await _embedDirect([params.query], params.embed_model, params.ollama_base, params.embed_flavor);
+  const results = await _qdrantSearchDirect(
+    params.qdrant_url, params.collection, vecs[0], params.top_k, params.score_threshold || 0
+  );
+  return { results };
+}
+
+/** Direct-mode replacement for GET /api/rag/collections. */
+async function _ragListCollectionsDirect(qdrantUrl) {
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  const resp = await fetch(`${base}/collections`);
+  if (!resp.ok) throw new Error(`Qdrant HTTP ${resp.status}`);
+  const data = await resp.json();
+  const names = ((data.result && data.result.collections) || []).map(c => c.name);
+  const collections = await Promise.all(names.map(async (name) => {
+    try {
+      const infoResp = await fetch(`${base}/collections/${encodeURIComponent(name)}`);
+      if (!infoResp.ok) throw new Error(`HTTP ${infoResp.status}`);
+      const info = (await infoResp.json()).result || {};
+      const vectors = info.config?.params?.vectors;
+      let dim = '?', dist = '?';
+      if (vectors && typeof vectors.size !== 'undefined') {
+        dim = vectors.size; dist = vectors.distance;
+      } else if (vectors && typeof vectors === 'object') {
+        const firstVec = Object.values(vectors)[0];
+        if (firstVec) { dim = firstVec.size; dist = firstVec.distance; }
+      }
+      return {
+        name,
+        points_count: info.points_count ?? info.vectors_count ?? 0,
+        dimension:    dim,
+        distance:     dist,
+        status:       info.status || '?',
+      };
+    } catch (e) {
+      return { name, error: e.message };
+    }
+  }));
+  return { collections };
+}
+
+/**
+ * Direct-mode replacement for GET /api/rag/embed-models. Lists models from
+ * Ollama's /api/tags (or an OpenAI-compatible /v1/models) and filters down
+ * to likely embedding models using the exact same keyword list rag.py's
+ * list_embed_models() uses server-side, so the dropdown shows the same
+ * models either way — this is what was missing: without the backend, this
+ * endpoint doesn't exist, so the catch(_){} in _loadEmbedModels() silently
+ * left the dropdown on its single hardcoded RAG_EMBED_MODEL fallback
+ * ("nomic-embed-text"), even though e.g. bge-m3 was installed and visible
+ * in the model status window (which talks to Ollama directly, same as this).
+ */
+const _RAG_EMBED_KEYWORDS = [
+  'embed', 'embedding', 'minilm', 'bge-', 'e5-', 'gte-',
+  'instructor', 'all-minilm', 'paraphrase', 'multilingual', 'sentence',
+];
+
+function _isEmbedModelName(name) {
+  const n = (name || '').toLowerCase();
+  return _RAG_EMBED_KEYWORDS.some(kw => n.includes(kw));
+}
+
+async function _listEmbedModelsDirect(ollamaBase, flavor) {
+  const base = (ollamaBase || '').replace(/\/$/, '');
+  try {
+    let allModels = [];
+    if (flavor === 'openai') {
+      const resp = await fetch(`${base}/v1/models`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      allModels = (data.data || []).map(m => m.id);
+    } else {
+      const resp = await fetch(`${base}/api/tags`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      allModels = (data.models || []).map(m => m.name);
+    }
+    // Same fallback logic as rag.py: if the keyword filter matches nothing
+    // (e.g. a non-standard embed model name), show the full list rather
+    // than an empty dropdown.
+    const filtered = allModels.filter(_isEmbedModelName);
+    return { models: filtered.length ? filtered : allModels };
+  } catch (e) {
+    return { models: [], error: e.message };
+  }
+}
+
+/** Direct-mode replacement for GET /api/rag/probe-dimension. */
+async function _probeDimensionDirect(model, ollamaBase, flavor) {
+  const vecs = await _embedDirect(['hello'], model, ollamaBase, flavor);
+  if (!vecs || !vecs[0] || !vecs[0].length) throw new Error('Empty embedding returned');
+  return { dimension: vecs[0].length, model };
+}
+
 // ── Collection management ─────────────────────────────────────
 async function refreshRagCollections() {
-  const url = `${_ragBackendBase()}/api/rag/collections?qdrant_url=${encodeURIComponent(RAG_QDRANT_URL)}`;
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    const data = _ragDirectMode()
+      ? await _ragListCollectionsDirect(RAG_QDRANT_URL)
+      : await (async () => {
+          const resp = await fetch(`${_ragBackendBase()}/api/rag/collections?qdrant_url=${encodeURIComponent(RAG_QDRANT_URL)}`);
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.json();
+        })();
     ragCollections = data.collections || [];
     _renderCollectionList();
     _populateCollectionSelects();
@@ -245,11 +510,8 @@ async function _inspectCollection(name) {
     if (!points.length) { body.innerHTML = '<div class="rag-empty">No points in this collection.</div>'; return; }
     body.innerHTML = points.map(p => {
       let metaBadges = '';
-      if (p.ril_number)    metaBadges += `<span class="rag-point-idx">Ril ${_esc(p.ril_number)}</span>`;
       if (p.page)          metaBadges += `<span class="rag-point-idx">Seite ${_esc(p.page)}</span>`;
       if (p.section_title) metaBadges += `<span class="rag-point-idx">${_esc(p.section_title)}</span>`;
-      if (p.module_title && p.module_title !== p.section_title)
-                           metaBadges += `<span class="rag-point-idx">${_esc(p.module_title)}</span>`;
       if (p.json_key != null) metaBadges += `<span class="rag-point-idx">elem[${_esc(String(p.json_key))}]</span>`;
       if (!metaBadges && p.chunk_index != null)
                            metaBadges += `<span class="rag-point-idx">chunk #${p.chunk_index}</span>`;
@@ -344,8 +606,6 @@ async function _ingestFile(file, collection) {
   fd.append('chapter_heading_regex',  ragChapterHeadingRegex?.value  || '');
   fd.append('chapter_fallback',       ragChapterFallback?.value      || 'recursive');
   fd.append('chapter_breadcrumb_sep', ragChapterBreadcrumbSep?.value || ' > ');
-  const cleanEl = document.getElementById('rag-clean-chunks');
-  fd.append('clean_chunks',   (cleanEl?.checked && !cleanEl?.disabled) ? 'true' : 'false');
 
   if (ragIngestLog) {
     ragIngestLog.innerHTML += `<div class="rag-log-section">📄 ${_esc(file.name)}</div>`;
@@ -411,21 +671,27 @@ async function _doSearch() {
   if (ragSearchBtn) ragSearchBtn.disabled = true;
 
   try {
-    const resp = await fetch('/api/rag/search', {
-      method:  'POST',
-      headers: {'Content-Type': 'application/json'},
-      body:    JSON.stringify({
-        collection,
-        query,
-        top_k:        parseInt(ragSearchTopK?.value) || 5,
-        embed_model:  ragEmbedModel?.value  || RAG_EMBED_MODEL,
-        embed_flavor: ragEmbedFlavor?.value || RAG_EMBED_FLAVOR,
-        ollama_base:  OLLAMA_BASE,
-        qdrant_url:   RAG_QDRANT_URL,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || 'Search failed');
+    const searchParams = {
+      collection,
+      query,
+      top_k:        parseInt(ragSearchTopK?.value) || 5,
+      embed_model:  ragEmbedModel?.value  || RAG_EMBED_MODEL,
+      embed_flavor: ragEmbedFlavor?.value || RAG_EMBED_FLAVOR,
+      ollama_base:  OLLAMA_BASE,
+      qdrant_url:   RAG_QDRANT_URL,
+    };
+    const data = _ragDirectMode()
+      ? await _ragSearchDirect(searchParams)
+      : await (async () => {
+          const resp = await fetch('/api/rag/search', {
+            method:  'POST',
+            headers: {'Content-Type': 'application/json'},
+            body:    JSON.stringify(searchParams),
+          });
+          const d = await resp.json();
+          if (!resp.ok) throw new Error(d.detail || 'Search failed');
+          return d;
+        })();
     // Show exactly what the model would receive: apply the same
     // whitelist/blacklist field filter configured in Settings → RAG
     // (_filterRagFields always keeps text/score; everything else is subject
@@ -444,8 +710,8 @@ async function _doSearch() {
 // the test view always mirrors exactly what the model's rag_search tool
 // would receive, whatever the Settings → RAG whitelist/blacklist allows.
 const _RAG_BADGE_FIELDS = new Set([
-  'source', 'breadcrumb', 'chapter_title', 'section_title', 'module_title',
-  'ril_number', 'page', 'book', 'chapter_number', 'chunk_index',
+  'source', 'breadcrumb', 'chapter_title', 'section_title',
+  'page', 'book', 'chapter_number', 'chunk_index',
   'chunk_part', 'chunk_parts_total', 'json_key',
 ]);
 
@@ -457,12 +723,9 @@ function _renderSearchResults(results) {
     if (r.source)         metaBadges += `<span class="rag-point-source">${_esc(r.source)}</span>`;
     if (r.breadcrumb)      metaBadges += `<span class="rag-point-idx">${_esc(r.breadcrumb)}</span>`;
     else if (r.chapter_title) metaBadges += `<span class="rag-point-idx">${_esc(r.chapter_title)}</span>`;
-    if (r.ril_number)     metaBadges += `<span class="rag-point-idx">Ril ${_esc(r.ril_number)}</span>`;
     if (r.page)           metaBadges += `<span class="rag-point-idx">Seite ${_esc(r.page)}</span>`;
     if (r.section_title && r.section_title !== r.breadcrumb)
                            metaBadges += `<span class="rag-point-idx">${_esc(r.section_title)}</span>`;
-    if (r.module_title && r.module_title !== r.section_title)
-                           metaBadges += `<span class="rag-point-idx">${_esc(r.module_title)}</span>`;
     if (r.json_key != null) metaBadges += `<span class="rag-point-idx">elem[${_esc(String(r.json_key))}]</span>`;
     if (r.chunk_part != null && r.chunk_parts_total != null)
                            metaBadges += `<span class="rag-point-idx">part ${_esc(String(r.chunk_part))}/${_esc(String(r.chunk_parts_total))}</span>`;
@@ -502,8 +765,9 @@ async function _loadEmbedModels() {
   if (!ragEmbedModel) return;
   try {
     const flavor = ragEmbedFlavor?.value || RAG_EMBED_FLAVOR;
-    const resp   = await fetch(`/api/rag/embed-models?ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${flavor}`);
-    const data   = await resp.json();
+    const data   = _ragDirectMode()
+      ? await _listEmbedModelsDirect(OLLAMA_BASE, flavor)
+      : await (await fetch(`/api/rag/embed-models?ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${flavor}`)).json();
     const models = data.models || [];
     const prev   = localStorage.getItem('rag_embed_model') || ragEmbedModel.value || RAG_EMBED_MODEL;
     ragEmbedModel.innerHTML = models.length
@@ -542,7 +806,6 @@ async function _loadEmbedModels() {
   function _updateChunkControls() {
     const strategy = ragChunkStrategy?.value || 'fixed';
     const sizeless  = _SIZELESS_STRATEGIES.has(strategy);
-    const isRil     = strategy === 'ril_document';
     const isChapter = strategy === 'chapter_aware';
 
     if (ragChunkSize) {
@@ -553,10 +816,6 @@ async function _loadEmbedModels() {
       ragChunkOverlap.disabled = sizeless;
       ragChunkOverlap.closest('.rag-form-row')?.classList.toggle('rag-field-disabled', sizeless);
     }
-
-    // Show "Clean chunks" checkbox only for ril_document strategy
-    const cleanRow = document.getElementById('rag-clean-row');
-    if (cleanRow) cleanRow.style.display = isRil ? '' : 'none';
 
     // Show chapter_aware-only controls: heading pattern, custom regex (only
     // when preset === 'custom'), breadcrumb separator, and the oversized-
@@ -579,8 +838,7 @@ async function _loadEmbedModels() {
     const sizeLabel    = sizeRow?.querySelector('label');
     const overlapLabel = overlapRow?.querySelector('label');
     if (sizeLabel && !sizeless)
-      sizeLabel.textContent = isRil ? 'Max chars / chunk'
-                             : isChapter ? 'Max chars / chapter (before splitting)'
+      sizeLabel.textContent = isChapter ? 'Max chars / chapter (before splitting)'
                              : 'Chunk size (chars)';
     if (overlapLabel && !sizeless) overlapLabel.textContent = 'Overlap (chars)';
   }
@@ -616,7 +874,6 @@ async function _loadEmbedModels() {
     { key: 'rag_chunk_size',      el: () => ragChunkSize      },
     { key: 'rag_chunk_overlap',   el: () => ragChunkOverlap   },
     { key: 'rag_chunk_strategy',  el: () => ragChunkStrategy  },
-    { key: 'rag_clean_chunks',    el: () => document.getElementById('rag-clean-chunks') },
     { key: 'rag_chapter_heading_preset', el: () => ragChapterHeadingPreset },
     { key: 'rag_chapter_heading_regex',  el: () => ragChapterHeadingRegex  },
     { key: 'rag_chapter_fallback',       el: () => ragChapterFallback      },
@@ -693,11 +950,16 @@ async function _loadEmbedModels() {
       ragProbeDimBtn.disabled = true;
       ragProbeDimBtn.textContent = '…';
       try {
-        const resp = await fetch(
-          `/api/rag/probe-dimension?model=${encodeURIComponent(model)}&ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${encodeURIComponent(flavor)}`
-        );
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || 'Failed');
+        const data = _ragDirectMode()
+          ? await _probeDimensionDirect(model, OLLAMA_BASE, flavor)
+          : await (async () => {
+              const resp = await fetch(
+                `/api/rag/probe-dimension?model=${encodeURIComponent(model)}&ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${encodeURIComponent(flavor)}`
+              );
+              const d = await resp.json();
+              if (!resp.ok) throw new Error(d.detail || 'Failed');
+              return d;
+            })();
         if (ragNewColDim) ragNewColDim.value = data.dimension;
         showToast(`Dimension: ${data.dimension} (${model.replace(/:latest$/,'')})`, 'success');
       } catch (e) {
@@ -715,8 +977,9 @@ async function _loadEmbedModels() {
     const flavor = document.getElementById('set-rag-embed-flavor')?.value || RAG_EMBED_FLAVOR;
     const prev   = setRagEmbedModelSel.value || RAG_EMBED_MODEL;
     try {
-      const resp = await fetch(`/api/rag/embed-models?ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${encodeURIComponent(flavor)}`);
-      const data = await resp.json();
+      const data = _ragDirectMode()
+        ? await _listEmbedModelsDirect(OLLAMA_BASE, flavor)
+        : await (await fetch(`/api/rag/embed-models?ollama_base=${encodeURIComponent(OLLAMA_BASE)}&flavor=${encodeURIComponent(flavor)}`)).json();
       const models = data.models || [];
       if (models.length) {
         setRagEmbedModelSel.innerHTML = models.map(m =>
@@ -831,24 +1094,28 @@ async function injectRagContext(messages, userQuery) {
   if (!collection || !userQuery) return { messages, chunks: [] };
 
   let chunks = [];
+  const searchParams = {
+    collection,
+    query:        userQuery.slice(0, 2000),
+    top_k:        RAG_TOP_K,
+    embed_model:  RAG_EMBED_MODEL,
+    embed_flavor: RAG_EMBED_FLAVOR,
+    ollama_base:  OLLAMA_BASE,
+    qdrant_url:   RAG_QDRANT_URL,
+  };
   try {
-    const resp = await fetch('/api/rag/search', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        collection,
-        query:        userQuery.slice(0, 2000),
-        top_k:        RAG_TOP_K,
-        embed_model:  RAG_EMBED_MODEL,
-        embed_flavor: RAG_EMBED_FLAVOR,
-        ollama_base:  OLLAMA_BASE,
-        qdrant_url:   RAG_QDRANT_URL,
-      }),
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      chunks = data.results || [];
-    }
+    const data = _ragDirectMode()
+      ? await _ragSearchDirect(searchParams)
+      : await (async () => {
+          const resp = await fetch('/api/rag/search', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(searchParams),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.json();
+        })();
+    chunks = data.results || [];
   } catch (_) {}
 
   if (!chunks.length) return { messages, chunks: [] };
@@ -876,12 +1143,10 @@ function _buildContextBlock(collection, chunks) {
 
     // Build a rich reference line depending on available metadata
     let ref = _src ? _src : '';
-    if (c.ril_number)    ref += ` · Ril ${c.ril_number}`;
     if (c.page)          ref += ` · Seite ${c.page}`;
     if (c.section_title) ref += ` · ${c.section_title}`;
-    if (c.module_title && c.module_title !== c.section_title) ref += ` (${c.module_title})`;
     if (c.json_key != null) ref += ` · element[${c.json_key}]`;
-    if (c.chunk_index != null && !c.ril_number && c.json_key == null)
+    if (c.chunk_index != null && c.json_key == null)
       ref += `, chunk ${c.chunk_index}`;
 
     block += `### [${i+1}]${ref ? ' ' + ref.trim() : ''} (score ${_score})\n${_body}\n\n`;
@@ -919,11 +1184,8 @@ function renderRagContextCard(collection, chunks, chatId) {
   const chunksHtml = chunks.map((c, i) => {
     // Build metadata badge line
     let metaBadges = '';
-    if (c.ril_number)    metaBadges += `<span class="rag-point-idx">Ril ${_esc(c.ril_number)}</span>`;
     if (c.page)          metaBadges += `<span class="rag-point-idx">Seite ${_esc(c.page)}</span>`;
     if (c.section_title) metaBadges += `<span class="rag-point-idx">${_esc(c.section_title)}</span>`;
-    if (c.module_title && c.module_title !== c.section_title)
-                         metaBadges += `<span class="rag-point-idx">${_esc(c.module_title)}</span>`;
     if (c.json_key != null) metaBadges += `<span class="rag-point-idx">elem[${_esc(String(c.json_key))}]</span>`;
     if (!metaBadges && c.chunk_index != null)
                          metaBadges += `<span class="rag-point-idx">chunk ${c.chunk_index}</span>`;
@@ -1116,22 +1378,27 @@ async function executeRagSearchTool(argsObj) {
   topK = Math.max(1, Math.min(20, topK));
 
   let chunks = [];
+  const searchParams = {
+    collection,
+    query,
+    top_k:        topK,
+    embed_model:  RAG_EMBED_MODEL,
+    embed_flavor: RAG_EMBED_FLAVOR,
+    ollama_base:  OLLAMA_BASE,
+    qdrant_url:   RAG_QDRANT_URL,
+  };
   try {
-    const resp = await fetch('/api/rag/search', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        collection,
-        query,
-        top_k:        topK,
-        embed_model:  RAG_EMBED_MODEL,
-        embed_flavor: RAG_EMBED_FLAVOR,
-        ollama_base:  OLLAMA_BASE,
-        qdrant_url:   RAG_QDRANT_URL,
-      }),
-    });
-    if (!resp.ok) return JSON.stringify({ error: `RAG search failed: HTTP ${resp.status}` });
-    const data = await resp.json();
+    const data = _ragDirectMode()
+      ? await _ragSearchDirect(searchParams)
+      : await (async () => {
+          const resp = await fetch('/api/rag/search', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(searchParams),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.json();
+        })();
     chunks = data.results || [];
   } catch (e) {
     return JSON.stringify({ error: `RAG search failed: ${e.message}` });
@@ -1148,9 +1415,9 @@ async function executeRagSearchTool(argsObj) {
   }
 
   // Pass through the full chunk payload by default (source, score, text,
-  // plus whatever extra metadata fields the collection stores — ril_number,
-  // page, section_title, module_title, breadcrumb, etc.), then apply the
-  // user's whitelist/blacklist (Settings → RAG) if one is configured.
+  // plus whatever extra metadata fields the collection stores — page,
+  // section_title, breadcrumb, etc.), then apply the user's whitelist/
+  // blacklist (Settings → RAG) if one is configured.
   return JSON.stringify({ query, top_k: topK, results: chunks.map(_filterRagFields) });
 }
 

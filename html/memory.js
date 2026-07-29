@@ -50,6 +50,285 @@ function _memoryHeaders(extra) {
   return { 'X-Client-ID': getEffectiveClientId(), ...(extra || {}) };
 }
 
+// ── Direct (no-backend) memory search ───────────────────────────────────
+// Mirrors memory.py's memory_search_chunks(): same collection-naming
+// scheme (jarvis_memory_<sanitized client id>), same Qdrant Query API call,
+// same "no collection yet → []" tolerance. Reuses rag.js's _embedDirect()
+// for the embedding call rather than duplicating it — rag.js loads
+// immediately before this file (see load-order note at the top), so
+// _embedDirect is already a global by the time this runs.
+//
+// Retrieval only: saving/updating/deleting memories still requires the
+// backend, since memory.py writes the markdown source-of-truth files
+// server-side — the browser has no filesystem access to do that itself.
+function _sanitizeClientIdDirect(clientId) {
+  const slug = String(clientId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '').slice(0, 64);
+  return slug || 'anonymous';
+}
+
+function _memoryCollectionNameDirect(clientId) {
+  return `jarvis_memory_${_sanitizeClientIdDirect(clientId)}`;
+}
+
+async function _memorySearchDirect(query, topK, scoreThreshold, embedModel, embedFlavor, ollamaBase, qdrantUrl) {
+  if (typeof _embedDirect !== 'function') return []; // rag.js didn't load / load order broken
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  const collection = _memoryCollectionNameDirect(getEffectiveClientId());
+
+  // Same tolerance as memory.py: a client with nothing saved yet has no
+  // collection at all — that's not an error, just an empty result.
+  try {
+    const infoResp = await fetch(`${base}/collections/${encodeURIComponent(collection)}`);
+    if (!infoResp.ok) return [];
+  } catch (_) { return []; }
+
+  try {
+    const vecs = await _embedDirect([query], embedModel, ollamaBase, embedFlavor);
+    const resp = await fetch(`${base}/collections/${encodeURIComponent(collection)}/points/query`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: vecs[0],
+        limit: topK,
+        with_payload: true,
+        score_threshold: (scoreThreshold && scoreThreshold > 0) ? scoreThreshold : null,
+      }),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const points = (data.result && data.result.points) || [];
+    return points.map(p => ({ id: String(p.id), score: Math.round((p.score || 0) * 1e4) / 1e4, ...(p.payload || {}) }));
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * crypto.randomUUID() requires a secure context (https, or localhost) —
+ * this app is frequently accessed over plain HTTP on a LAN IP, which is
+ * NOT a secure context, so that API silently doesn't exist there. Fallback
+ * to a plain RFC4122-ish v4 generator so direct-mode save/update never
+ * hard-fails just because of how the page happens to be served.
+ */
+function _uuidv4() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try { return crypto.randomUUID(); } catch (_) {}
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+/**
+ * Create this client's Qdrant collection on first use if it doesn't exist
+ * yet — mirrors memory.py's _ensure_memory_collection(). A create-after-
+ * exists race just gets swallowed (Qdrant already has it), same tolerance
+ * as the server-side version.
+ */
+async function _ensureMemoryCollectionDirect(qdrantUrl, collection, dim) {
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  try {
+    const resp = await fetch(`${base}/collections/${encodeURIComponent(collection)}`);
+    if (resp.ok) return;
+  } catch (_) {}
+  try {
+    await fetch(`${base}/collections/${encodeURIComponent(collection)}`, {
+      method:  'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ vectors: { size: dim, distance: 'Cosine' } }),
+    });
+  } catch (_) {}
+}
+
+/** Upsert one point directly into Qdrant — mirrors memory.py's _upsert_point(). */
+async function _upsertMemoryPointDirect(qdrantUrl, collection, id, vector, payload) {
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  const resp = await fetch(`${base}/collections/${encodeURIComponent(collection)}/points?wait=true`, {
+    method:  'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ points: [{ id, vector, payload }] }),
+  });
+  if (!resp.ok) throw new Error(`Qdrant upsert HTTP ${resp.status}`);
+}
+
+/** Fetch one point's current payload by id, for partial updates. Returns null if missing. */
+async function _retrieveMemoryPointDirect(qdrantUrl, collection, id) {
+  const base = (qdrantUrl || '').replace(/\/$/, '');
+  try {
+    const resp = await fetch(`${base}/collections/${encodeURIComponent(collection)}/points`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ ids: [id], with_payload: true, with_vector: false }),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return (data.result || [])[0] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── Tool executors: save_memory / search_memory / update_memory ────────
+// Called by tools.js's BUILTIN_CATALOGUE entries — same delegation pattern
+// rag.js already uses for the rag_search tool (see executeRagSearchTool /
+// getRagToolSchema there, and tools.js's window.executeRagSearchTool call).
+// Each of these branches internally on BACKEND_AVAILABLE:
+//
+//   BACKEND AVAILABLE  → unchanged. Goes through /api/memory/*, which
+//     writes the markdown file (source of truth) AND the Qdrant index,
+//     exactly as before this change.
+//
+//   DIRECT / NO BACKEND → new. Writes ONLY into Qdrant — there is no
+//     filesystem the browser can write markdown to. This means Qdrant is,
+//     for entries saved in this mode, the *only* copy, not the disposable
+//     rebuildable index memory.py normally treats it as. Practical
+//     consequences: these entries won't appear in Settings → Memory browse
+//     /edit (that reads markdown files) and won't survive a "reindex all"
+//     later, since there's no markdown to reindex from. Search/recall
+//     works fine either way, since that only ever reads Qdrant.
+
+async function executeSaveMemoryTool({ text, tags, confidence }) {
+  if (!text || !text.trim()) throw new Error('text must not be empty.');
+  const cleanText       = text.trim().slice(0, 4000);
+  const cleanTags       = Array.isArray(tags) ? tags.slice(0, 10).map(String) : [];
+  const cleanConfidence = (confidence === 'inferred') ? 'inferred' : 'stated';
+
+  if (typeof BACKEND_AVAILABLE === 'undefined' || !BACKEND_AVAILABLE) {
+    const now        = new Date().toISOString();
+    const id          = _uuidv4();
+    const collection  = _memoryCollectionNameDirect(getEffectiveClientId());
+    try {
+      const vecs = await _embedDirect([cleanText], RAG_EMBED_MODEL, OLLAMA_BASE, RAG_EMBED_FLAVOR);
+      await _ensureMemoryCollectionDirect(RAG_QDRANT_URL, collection, vecs[0].length);
+      await _upsertMemoryPointDirect(RAG_QDRANT_URL, collection, id, vecs[0], {
+        text:       cleanText,
+        tags:       cleanTags,
+        source:     (typeof CHAT_ID !== 'undefined' && CHAT_ID) || 'chat',
+        confidence: cleanConfidence,
+        created:    now,
+        updated:    now,
+      });
+    } catch (e) {
+      return JSON.stringify({ saved: true, id, indexed: false, error: e.message });
+    }
+    if (typeof showToast === 'function') {
+      showToast(`Saved to memory: "${cleanText.slice(0, 60)}${cleanText.length > 60 ? '…' : ''}"`, 2500);
+    }
+    return JSON.stringify({ saved: true, id, indexed: true });
+  }
+
+  const resp = await fetch('/api/memory/save', {
+    method:  'POST',
+    headers: _memoryHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      text:         cleanText,
+      tags:         cleanTags,
+      confidence:   cleanConfidence,
+      source:       (typeof CHAT_ID !== 'undefined' && CHAT_ID) || 'chat',
+      embed_model:  RAG_EMBED_MODEL,
+      embed_flavor: RAG_EMBED_FLAVOR,
+      ollama_base:  OLLAMA_BASE,
+      qdrant_url:   RAG_QDRANT_URL,
+    }),
+  });
+  if (!resp.ok) throw new Error(`Failed to save memory: HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (typeof showToast === 'function') {
+    showToast(`Saved to memory: "${cleanText.slice(0, 60)}${cleanText.length > 60 ? '…' : ''}"`, 2500);
+  }
+  return JSON.stringify({ saved: true, id: data.id, indexed: !!data.indexed });
+}
+
+async function executeSearchMemoryTool({ query, top_k }) {
+  if (!query || !query.trim()) throw new Error('query must not be empty.');
+  let topK = parseInt(top_k, 10);
+  if (!Number.isFinite(topK)) topK = 5;
+  topK = Math.max(1, Math.min(20, topK));
+  const cleanQuery     = query.trim().slice(0, 2000);
+  const scoreThreshold = (typeof MEMORY_MIN_SCORE === 'number') ? MEMORY_MIN_SCORE : 0.55;
+
+  let results;
+  if (typeof BACKEND_AVAILABLE === 'undefined' || !BACKEND_AVAILABLE) {
+    results = await _memorySearchDirect(
+      cleanQuery, topK, scoreThreshold, RAG_EMBED_MODEL, RAG_EMBED_FLAVOR, OLLAMA_BASE, RAG_QDRANT_URL,
+    );
+  } else {
+    const resp = await fetch('/api/memory/search', {
+      method:  'POST',
+      headers: _memoryHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        query: cleanQuery, top_k: topK, score_threshold: scoreThreshold,
+        embed_model: RAG_EMBED_MODEL, embed_flavor: RAG_EMBED_FLAVOR,
+        ollama_base: OLLAMA_BASE, qdrant_url: RAG_QDRANT_URL,
+      }),
+    });
+    if (!resp.ok) throw new Error(`Memory search failed: HTTP ${resp.status}`);
+    const data = await resp.json();
+    results = data.results || [];
+  }
+  return JSON.stringify({ query: cleanQuery, top_k: topK, results });
+}
+
+async function executeUpdateMemoryTool({ id, text, tags, confidence }) {
+  if (!id || !String(id).trim()) throw new Error('id is required — call search_memory first to find it.');
+  const cleanId = String(id).trim();
+
+  if (typeof BACKEND_AVAILABLE === 'undefined' || !BACKEND_AVAILABLE) {
+    const collection = _memoryCollectionNameDirect(getEffectiveClientId());
+    const existing = await _retrieveMemoryPointDirect(RAG_QDRANT_URL, collection, cleanId);
+    if (!existing) {
+      throw new Error(`No memory found with id "${cleanId}". Use search_memory to find the correct id, or save_memory if this is actually new information.`);
+    }
+    const p = existing.payload || {};
+    const newText       = (typeof text === 'string' && text.trim()) ? text.trim().slice(0, 4000) : (p.text || '');
+    const newTags       = Array.isArray(tags) ? tags.slice(0, 10).map(String) : (p.tags || []);
+    const newConfidence = (confidence === 'stated' || confidence === 'inferred') ? confidence : (p.confidence || 'stated');
+    const now = new Date().toISOString();
+    try {
+      const vecs = await _embedDirect([newText], RAG_EMBED_MODEL, OLLAMA_BASE, RAG_EMBED_FLAVOR);
+      await _upsertMemoryPointDirect(RAG_QDRANT_URL, collection, cleanId, vecs[0], {
+        text: newText, tags: newTags, source: p.source || 'chat',
+        confidence: newConfidence, created: p.created || now, updated: now,
+      });
+    } catch (e) {
+      return JSON.stringify({ updated: true, id: cleanId, indexed: false, error: e.message });
+    }
+    if (typeof showToast === 'function') {
+      showToast(`Memory updated${newText ? `: "${newText.slice(0, 60)}${newText.length > 60 ? '…' : ''}"` : ''}`, 2500);
+    }
+    return JSON.stringify({ updated: true, id: cleanId, indexed: true });
+  }
+
+  const body = {
+    embed_model: RAG_EMBED_MODEL, embed_flavor: RAG_EMBED_FLAVOR,
+    ollama_base: OLLAMA_BASE, qdrant_url: RAG_QDRANT_URL,
+  };
+  if (typeof text === 'string' && text.trim()) body.text = text.trim().slice(0, 4000);
+  if (Array.isArray(tags)) body.tags = tags.slice(0, 10).map(String);
+  if (confidence === 'stated' || confidence === 'inferred') body.confidence = confidence;
+
+  const resp = await fetch(`/api/memory/${encodeURIComponent(cleanId)}`, {
+    method:  'PUT',
+    headers: _memoryHeaders({ 'Content-Type': 'application/json' }),
+    body:    JSON.stringify(body),
+  });
+  if (resp.status === 404) {
+    throw new Error(`No memory found with id "${cleanId}". Use search_memory to find the correct id, or save_memory if this is actually new information.`);
+  }
+  if (!resp.ok) throw new Error(`Failed to update memory: HTTP ${resp.status}`);
+  const data = await resp.json();
+  if (typeof showToast === 'function') {
+    showToast(`Memory updated${text ? `: "${text.trim().slice(0, 60)}${text.trim().length > 60 ? '…' : ''}"` : ''}`, 2500);
+  }
+  return JSON.stringify({ updated: true, id: data.id, indexed: !!data.indexed });
+}
+
+window.executeSaveMemoryTool   = executeSaveMemoryTool;
+window.executeSearchMemoryTool = executeSearchMemoryTool;
+window.executeUpdateMemoryTool = executeUpdateMemoryTool;
+
 /**
  * Client-side memory retrieval + injection, used on BOTH chat paths.
  * Embeds the latest user turn, retrieves top-k memories from the server's
@@ -65,26 +344,38 @@ async function injectMemoryContext(messages, userQuery) {
   if (typeof MEMORY_ENABLED !== 'undefined' && !MEMORY_ENABLED) return { messages, chunks: [] };
   if (!userQuery) return { messages, chunks: [] };
 
+  const topK           = (typeof MEMORY_TOP_K === 'number' && MEMORY_TOP_K) || 5;
+  const scoreThreshold  = (typeof MEMORY_MIN_SCORE === 'number') ? MEMORY_MIN_SCORE : 0.55;
+
   let chunks = [];
-  try {
-    const resp = await fetch('/api/memory/search', {
-      method:  'POST',
-      headers: _memoryHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        query:        userQuery.slice(0, 2000),
-        top_k:        (typeof MEMORY_TOP_K === 'number' && MEMORY_TOP_K) || 5,
-        score_threshold: (typeof MEMORY_MIN_SCORE === 'number') ? MEMORY_MIN_SCORE : 0.55,
-        embed_model:  RAG_EMBED_MODEL,
-        embed_flavor: RAG_EMBED_FLAVOR,
-        ollama_base:  OLLAMA_BASE,
-        qdrant_url:   RAG_QDRANT_URL,
-      }),
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      chunks = data.results || [];
-    }
-  } catch (_) {}
+  if (typeof BACKEND_AVAILABLE === 'undefined' || !BACKEND_AVAILABLE) {
+    // Direct path: no server.py to hit /api/memory/search on, so search
+    // Qdrant (via Ollama embeddings) straight from the browser.
+    chunks = await _memorySearchDirect(
+      userQuery.slice(0, 2000), topK, scoreThreshold,
+      RAG_EMBED_MODEL, RAG_EMBED_FLAVOR, OLLAMA_BASE, RAG_QDRANT_URL,
+    );
+  } else {
+    try {
+      const resp = await fetch('/api/memory/search', {
+        method:  'POST',
+        headers: _memoryHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          query:        userQuery.slice(0, 2000),
+          top_k:        topK,
+          score_threshold: scoreThreshold,
+          embed_model:  RAG_EMBED_MODEL,
+          embed_flavor: RAG_EMBED_FLAVOR,
+          ollama_base:  OLLAMA_BASE,
+          qdrant_url:   RAG_QDRANT_URL,
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        chunks = data.results || [];
+      }
+    } catch (_) {}
+  }
 
   if (!chunks.length) return { messages, chunks: [] };
 

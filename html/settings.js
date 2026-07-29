@@ -1899,7 +1899,7 @@ document.getElementById('settings-import-btn').addEventListener('click', importS
 
     <label title="Only inject memories scoring at or above this (0–1, cosine similarity)">Minimum score</label>
     <div style="display:flex;align-items:center;gap:8px;">
-      <input type="range" id="set-memory-min-score" min="0" max="1" step="0.05" style="flex:1;"
+      <input type="range" id="set-memory-min-score" min="0" max="1" step="0.01" style="flex:1;"
              title="Only inject memories scoring at or above this (0–1, cosine similarity)">
       <span id="memory-min-score-label" style="font-size:0.82em;color:var(--text2);width:34px;text-align:right;">0.55</span>
     </div>
