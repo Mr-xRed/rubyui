@@ -179,7 +179,6 @@ uvicorn
 httpx
 python-multipart
 markitdown[all]
-pymupdf4llm
 qdrant-client
 ```
 
