@@ -28,8 +28,13 @@ Both modes share the exact same UI and the exact same `html/` codebase — the f
 
 ---
 ## Screeenshots
+- Chat
 ![RubyUI Chat](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_chat.png)
+
+- Image Generation
 ![RubyUI Image Generation](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_image_gen.png)
+
+- Model Manager
 ![RubyUI Model Manager](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_model_manager.png)
 
 ---
