@@ -1,4 +1,5 @@
 import asyncio, json, time, uuid, tempfile, os
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, Response
@@ -1166,11 +1167,14 @@ def _safe_parse_args(arguments_str):
 
 async def _execute_tool_call(tc: dict, job: dict, job_id: str, cid: str) -> tuple[str, bool]:
     """Dispatch a single tool call to the right executor:
-    rag_search (built-in, server-side Qdrant retrieval), generate_image
-    (built-in, native image generation), or an HTTP tool from the job's
-    saved tools_config. MCP tools are rejected by _execute_http_tool with a
-    clear error message."""
+    get_current_datetime (built-in, native — no config needed), rag_search
+    (built-in, server-side Qdrant retrieval), generate_image (built-in,
+    native image generation), or an HTTP tool from the job's saved
+    tools_config. MCP tools are rejected by _execute_http_tool with a clear
+    error message."""
     name = tc["function"]["name"]
+    if name == "get_current_datetime":
+        return await _execute_get_current_datetime_tool(tc, job, job_id, cid)
     if name == "rag_search":
         return await _execute_rag_search_tool(tc, job, job_id, cid)
     if name == "generate_image":
@@ -1182,6 +1186,28 @@ async def _execute_tool_call(tc: dict, job: dict, job_id: str, cid: str) -> tupl
     if name == "update_memory":
         return await _execute_update_memory_tool(tc, job, job_id, cid)
     return await _execute_http_tool(tc, job)
+
+
+async def _execute_get_current_datetime_tool(tc: dict, job: dict, job_id: str, cid: str) -> tuple[str, bool]:
+    """Executes the built-in get_current_datetime tool natively, server-side.
+    Mirrors the client-side version in tools.js (ToolsEngine.BUILTIN_CATALOGUE)
+    field-for-field, but reports server time in UTC rather than the browser's
+    local time/timezone — a backend-offloaded job may still be running after
+    the tab that started it is closed, so there is no browser clock/timezone
+    to defer to. Requires no tools_config entry and makes no outbound call,
+    unlike _execute_http_tool's config-driven tools."""
+    now = datetime.now(timezone.utc)
+    return (
+        json.dumps({
+            "iso":      now.isoformat(),
+            "date":     now.strftime("%Y-%m-%d"),
+            "time":     now.strftime("%H:%M:%S"),
+            "time_24":  now.strftime("%H:%M"),
+            "weekday":  now.strftime("%A"),
+            "timezone": "UTC",
+        }),
+        False,
+    )
 
 
 async def _execute_generate_image_tool(tc: dict, job: dict, job_id: str, cid: str) -> tuple[str, bool]:
