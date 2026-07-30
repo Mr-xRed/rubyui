@@ -84,7 +84,7 @@ let IMG_API_MODE = localStorage.getItem('img_api_mode') || 'native';
 let IMG_API_BASE = localStorage.getItem('img_api_base') || '';
 let IMG_API_FLAVOR = localStorage.getItem('img_api_flavor') || (IMG_API_MODE === 'native' ? 'ollama' : 'openai');
 
-let CF_ACCESS_TEAM = localStorage.getItem('cf_access_team') || 'rubyrinth';
+let CF_ACCESS_TEAM = localStorage.getItem('cf_access_team') || 'none';
 
 let TOOLS_ENABLED = localStorage.getItem('tools_enabled') !== 'false';
 

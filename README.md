@@ -1,4 +1,4 @@
-# RubyUI — Local LLM UI
+# AmarinthUI — Local LLM UI
 
 A single-page, no-build-step frontend for local LLM inference. Talks directly to **Ollama**, **LM Studio**, or any **OpenAI-compatible** endpoint, with optional RAG (Qdrant) and long-term memory.
 
@@ -29,13 +29,13 @@ Both modes share the exact same UI and the exact same `html/` codebase — the f
 ---
 ## Screeenshots
 - Chat
-![RubyUI Chat](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_chat.png)
+![AmarinthUI Chat](https://raw.githubusercontent.com/Mr-xRed/amarinthui/refs/heads/main/screenshots/amarinthui_chat.png)
 
 - Image Generation
-![RubyUI Image Generation](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_image_gen.png)
+![AmarinthUI Image Generation](https://raw.githubusercontent.com/Mr-xRed/amarinthui/refs/heads/main/screenshots/amarinthui_image_gen.png)
 
 - Model Manager
-![RubyUI Model Manager](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_model_manager.png)
+![AmarinthUI Model Manager](https://raw.githubusercontent.com/Mr-xRed/amarinthui/refs/heads/main/screenshots/amarinthui_model_manager.png)
 
 ---
 
@@ -148,7 +148,7 @@ Open **Settings** in the app and set:
 ### Repo layout expected by `compose.yaml`
 
 ```
-rubyui/
+amarinthui/
 ├── Dockerfile
 ├── requirements.txt
 ├── compose.yaml
@@ -162,7 +162,7 @@ rubyui/
     └── nginx.conf        → nginx reverse-proxy config (not included in this repo snippet — see below)
 ```
 
-> `compose.yaml` binds these from an absolute host path (`/DATA/AppData/dockge/stacks/rubyui/...`), which is specific to the original deployment (Dockge on a NAS). **Edit the `source:` paths in `compose.yaml`** to match wherever you clone this repo before running it.
+> `compose.yaml` binds these from an absolute host path (`/DATA/AppData/dockge/stacks/amarinthui/...`), which is specific to the original deployment (Dockge on a NAS). **Edit the `source:` paths in `compose.yaml`** to match wherever you clone this repo before running it.
 
 ### `Dockerfile`
 
@@ -202,7 +202,7 @@ Three services:
 - **`qdrant`** — official `qdrant/qdrant` image. HTTP API + dashboard on `6333`, gRPC on `6334`. Storage bind-mounted for persistence across restarts.
 
 ```yaml
-name: rubyui
+name: amarinthui
 services:
   frontend:
     cpu_shares: 90
@@ -212,9 +212,9 @@ services:
         limits:
           memory: "6442450944"
     image: nginx:latest
-    container_name: rubyui-frontend
+    container_name: amarinthui-frontend
     networks:
-      - rubyui
+      - amarinthui
     depends_on:
       - backend
     ports:
@@ -238,7 +238,7 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    image: rubyui-backend:latest
+    image: amarinthui-backend:latest
     restart: unless-stopped
     working_dir: /app
     volumes:
@@ -246,17 +246,17 @@ services:
         source: ./api
         target: /app
     networks:
-      - rubyui
+      - amarinthui
     environment:
       - ORT_LOGGING_LEVEL=3
     depends_on:
       - qdrant # Added this to ensure DB starts before API
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: rubyui-qdrant
+    container_name: amarinthui-qdrant
     restart: unless-stopped
     networks:
-      - rubyui
+      - amarinthui
     ports:
       - 6333:6333 # HTTP API and Dashboard
       - 6334:6334 # gRPC
@@ -269,15 +269,15 @@ services:
     environment:
       - QDRANT__TELEMETRY_DISABLED=true
 networks:
-  rubyui:
+  amarinthui:
     driver: bridge
 ```
 
 ### Bring it up
 
 ```bash
-git clone <this-repo> rubyui
-cd rubyui
+git clone <this-repo> amarinthui
+cd amarinthui
 # Edit the `source:` bind paths in compose.yaml to point at this checkout
 docker compose up -d --build
 ```
@@ -321,7 +321,7 @@ All settings live in the in-app **Settings** modal and persist to `localStorage`
 ## Folder structure
 
 ```
-rubyui
+amarinthui
 ├── api                    Python/FastAPI backend (server mode only)
 │   ├── memory.py           Long-term memory: markdown + Qdrant, save/search/update
 │   ├── rag.py               RAG: ingestion, chunking, Qdrant CRUD, search

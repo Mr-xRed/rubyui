@@ -2344,7 +2344,7 @@ checkOllama();
 // ── Cloudflare Access logout ───────────────────────────────────
 // Revokes the session across ALL apps under this Zero Trust team in one
 // click — Cloudflare doesn't support a true per-app logout (only
-// team-wide), so this also logs you out of ollama.rubyrinth.xyz, not just
+// team-wide), so this also logs you out, not just
 // this app. `redirect_url` is a widely-used but undocumented param; if
 // Cloudflare ignores it you just land on its own logout confirmation page
 // instead of being bounced back here — harmless either way.

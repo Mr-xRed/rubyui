@@ -1,4 +1,4 @@
-name: rubyui
+name: amarinthui
 services:
   frontend:
     cpu_shares: 90
@@ -8,9 +8,9 @@ services:
         limits:
           memory: "6442450944"
     image: nginx:latest
-    container_name: rubyui-frontend
+    container_name: amarinthui-frontend
     networks:
-      - rubyui
+      - amarinthui
     depends_on:
       - backend
     ports:
@@ -34,7 +34,7 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    image: rubyui-backend:latest
+    image: amarinthui-backend:latest
     restart: unless-stopped
     working_dir: /app
     volumes:
@@ -42,17 +42,17 @@ services:
         source: ./api
         target: /app
     networks:
-      - rubyui
+      - amarinthui
     environment:
       - ORT_LOGGING_LEVEL=3
     depends_on:
       - qdrant
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: rubyui-qdrant
+    container_name: amarinthui-qdrant
     restart: unless-stopped
     networks:
-      - rubyui
+      - amarinthui
     ports:
       - 6333:6333
       - 6334:6334
@@ -65,5 +65,5 @@ services:
     environment:
       - QDRANT__TELEMETRY_DISABLED=true
 networks:
-  rubyui:
+  amarinthui:
     driver: bridge
