@@ -27,6 +27,12 @@ Both modes share the exact same UI and the exact same `html/` codebase — the f
 - [Folder structure](#folder-structure)
 
 ---
+## Screeenshots
+![RubyUI Chat](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_chat.png)
+![RubyUI Image Generation](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_image_gen.png)
+![RubyUI Model Manager](https://raw.githubusercontent.com/Mr-xRed/rubyui/refs/heads/main/screenshots/rubyui_model_manager.png)
+
+---
 
 ## How mode detection works
 
